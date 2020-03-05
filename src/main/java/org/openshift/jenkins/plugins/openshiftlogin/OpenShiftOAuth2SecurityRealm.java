@@ -24,10 +24,12 @@
  */
 package org.openshift.jenkins.plugins.openshiftlogin;
 
+import static java.lang.String.format;
 import static java.net.HttpURLConnection.HTTP_NOT_FOUND;
 import static java.net.HttpURLConnection.HTTP_OK;
 import static java.util.logging.Level.FINE;
 import static java.util.logging.Level.INFO;
+import static java.util.logging.Level.WARNING;
 import static org.apache.commons.lang.StringUtils.isNotBlank;
 import static org.openshift.jenkins.plugins.openshiftlogin.CredentialHttpRequestInitializer.JSON_FACTORY;
 
@@ -75,6 +77,7 @@ import com.google.api.client.auth.oauth2.AuthorizationCodeFlow;
 import com.google.api.client.auth.oauth2.BearerToken;
 import com.google.api.client.auth.oauth2.ClientParametersAuthentication;
 import com.google.api.client.auth.oauth2.Credential;
+import com.google.api.client.auth.oauth2.Credential.AccessMethod;
 import com.google.api.client.http.GenericUrl;
 import com.google.api.client.http.HttpContent;
 import com.google.api.client.http.HttpRequest;
@@ -425,20 +428,18 @@ public class OpenShiftOAuth2SecurityRealm extends SecurityRealm implements Seria
 
         }
 
-        if (withinAPod)
-            LOGGER.info(String.format(
-                    "OpenShift OAuth returning %s with namespace %s SA dir %s default %s SA name %s default %s client ID %s default %s secret %s default %s redirect %s default %s server %s default %s",
-                    runningInOpenShiftPodWithRequiredOAuthFeatures, this.namespace, this.serviceAccountDirectory,
-                    this.defaultedServiceAccountDirectory, this.serviceAccountName, this.defaultedServiceAccountName,
-                    this.clientId, this.defaultedClientId,
-                    (Secret.toString(this.clientSecret).length() > 6
-                            ? Secret.toString(this.clientSecret).substring(0, 5) + "......."
-                            : "null"),
-                    (this.defaultedClientSecret != null && this.defaultedClientSecret.length() > 6
-                            ? this.defaultedClientSecret.substring(0, 5) + "......."
-                            : "null"),
-                    this.redirectURL, this.defaultedRedirectURL, this.serverPrefix, this.defaultedServerPrefix));
-
+        if (withinAPod) {
+            String redactedClientSecret = Secret.toString(this.clientSecret).length() > 6 ? Secret.toString(this.clientSecret).substring(0, 5) + "......." : "null";
+            String redactedDefaultClientSecret = this.defaultedClientSecret != null && this.defaultedClientSecret.length() > 6 ? this.defaultedClientSecret.substring(0, 5) + "......." : "null";
+            String msg1 = "OpenShift OAuth running in k8s/openshift: [%s] with namespace [%s] ServiceAccount directory [%s]";
+            String msg2 = "     default ServiceAccount directory [%s] , serviceAccountName [%s], ";
+            String msg3 = "     clientId: [%s],  default clientID: [%s], clientSecret: [%s], default clientSecret: [%s],";
+            String msg4 = "     redirectUrl: [%s], default redirectUrl: [%s], serverPrefix: [%s], defaultedServerPrefix:[%s]";
+            LOGGER.info(format( msg1, runningInOpenShiftPodWithRequiredOAuthFeatures, this.namespace, this.serviceAccountDirectory ));
+            LOGGER.info(format(msg2, this.defaultedServiceAccountDirectory, this.serviceAccountName));
+            LOGGER.info(format(msg3, this.defaultedServiceAccountName, this.clientId, this.defaultedClientId, redactedClientSecret, redactedDefaultClientSecret));
+            LOGGER.info(format(msg4, this.redirectURL, this.defaultedRedirectURL, this.serverPrefix, this.defaultedServerPrefix));
+        }
         return runningInOpenShiftPodWithRequiredOAuthFeatures;
     }
 
@@ -521,11 +522,12 @@ public class OpenShiftOAuth2SecurityRealm extends SecurityRealm implements Seria
     private OpenShiftProviderInfo getOpenShiftOAuthProvider(final Credential credential, final HttpTransport transport)
             throws IOException {
         HttpRequestFactory requestFactory = transport.createRequestFactory(new CredentialHttpRequestInitializer(credential));
-        GenericUrl url = new GenericUrl(getDefaultedServerPrefix() + OAUTH_PROVIDER_URI);
-
+        String oauthProviderUrl = getDefaultedServerPrefix() + OAUTH_PROVIDER_URI;
+        LOGGER.info("Trying to determine OpenShift Provider information from URL: " + oauthProviderUrl);
+        GenericUrl url = new GenericUrl(oauthProviderUrl);
         HttpRequest request = requestFactory.buildGetRequest(url);
-
         OpenShiftProviderInfo info = request.execute().parseAs(OpenShiftProviderInfo.class);
+        LOGGER.info("OpenShift Provider information parsed as: " + info);
         return info;
     }
 
@@ -604,57 +606,43 @@ public class OpenShiftOAuth2SecurityRealm extends SecurityRealm implements Seria
     }
 
     private boolean useProviderOAuthEndpoint(final Credential credential) {
-        if (provider == null)
+        if (provider == null) {
+            LOGGER.log(WARNING,  "OpenShift OAuth has not provider defined.");
             return false;
+        }
         try {
+            LOGGER.info( "OpenShift OAuth will query  " + defaultedServerPrefix + "/version with credentials " + credential );
             GenericUrl url = new GenericUrl(defaultedServerPrefix + "/version");
             HttpRequestFactory requestFactory = transport.createRequestFactory(new CredentialHttpRequestInitializer(credential));
             HttpRequest request = requestFactory.buildGetRequest(url);
             com.google.api.client.http.HttpResponse response = request.execute();
             int rc = response.getStatusCode();
-            if (rc != HTTP_OK)
-                LOGGER.info(
-                        "OpenShift OAuth the attempt to get the server version request got an unexpected return code: "
-                                + rc);
+            if (rc != HTTP_OK) {
+                LOGGER.info( "OpenShift OAuth the attempt to get the server version request got an unexpected return code: " + rc);
+            }
+            LOGGER.info( "Server succesfully queried to get OpenShift version, now parsing it..." );
             OpenShiftVersionInfo version = response.parseAs(OpenShiftVersionInfo.class);
-            if (version != null && version.major != null && version.major.equals("1")) {
-                if (version.minor.length() > 2) {
-                    String minor = version.minor.substring(0, 2); // per javadoc end index is not inclusive
-                    int m = Integer.parseInt(minor);
-                    if (m <= 11) {
-                        // 3.x cluster
-                        LOGGER.info("OpenShift OAuth the server is 3.x, specifically " + version.toString());
-                        return false;
-                    } else {
-                        // 4.x cluster
-                        LOGGER.info("OpenShift OAuth server is 4.x, specifically " + version.toString());
-                        return true;
-                    }
-
-                } else {
-                    // 3.x cluster
-                    LOGGER.info("OpenShift OAuth the server is 3.x, specifically " + version.toString());
-                    return false;
-                }
-            } else {
-                // 3.x cluster
-                LOGGER.info("OpenShift OAuth server is 3.x, specifically " + version.toString());
-                return false;
+            if (version != null ) { 
+                boolean isOpenShift3Cluster = version.isOpenShift3Cluster();
+                LOGGER.info( "Now checking if we are on an OpenShift3 cluster and the answer is:  " + isOpenShift3Cluster);
+                // For now, this will always return true if "version" is not null, basically if we are in OpenShift
+                //TODO check if we can just return true
+                return isOpenShift3Cluster || version.isOpenShift4Cluster();
             }
         } catch (Throwable t) {
-            LOGGER.log(Level.INFO, "get version attempt failed", t);
+            LOGGER.log(Level.INFO, "Failed to get version attempt failed", t);
         }
+        LOGGER.info( "Determining OpenShift version failed...falling back into OpenShift3 behaviour");
         // default to old, traditional 3.x behavior
         return false;
     }
+
 
     private OpenShiftUserInfo getOpenShiftUserInfo(final Credential credential, final HttpTransport transport)
             throws IOException {
         HttpRequestFactory requestFactory = transport.createRequestFactory(new CredentialHttpRequestInitializer(credential));
         GenericUrl url = new GenericUrl(getDefaultedServerPrefix() + USER_URI);
-
         HttpRequest request = requestFactory.buildGetRequest(url);
-
         OpenShiftUserInfo info = request.execute().parseAs(OpenShiftUserInfo.class);
         return info;
     }
@@ -835,29 +823,37 @@ public class OpenShiftOAuth2SecurityRealm extends SecurityRealm implements Seria
         HttpTransport transportForThisRequest = transport;
         GenericUrl tsu = new GenericUrl(getDefaultedServerPrefix() + "/oauth/token");
         String asu = getDefaultedRedirectURL() + "/oauth/authorize";
-        final Credential credential = new Credential(BearerToken.authorizationHeaderAccessMethod())
-                .setAccessToken(getDefaultedClientSecret().getPlainText());
+        String accessToken = getDefaultedClientSecret().getPlainText();
+        final Credential credential = new Credential(BearerToken.authorizationHeaderAccessMethod()).setAccessToken(accessToken);
         if (useProviderOAuthEndpoint(credential)) {
             LOGGER.info("OpenShift OAuth using OAuth Provider specified endpoints for this login flow");
             tsu = new GenericUrl(provider.token_endpoint);
             asu = provider.authorization_endpoint;
             transportForThisRequest = transportToUse(credential);
         } else {
-            LOGGER.info("OpenShift OAuth using the OpenShift Jenkins Login Plugin default for the OAuth endpoints");
+            LOGGER.warning("OpenShift OAuth will use the OpenShift Jenkins Login Plugin default for the OAuth endpoints");
         }
+        
         final GenericUrl tokenServerURL = tsu;
         final String authorizationServerURL = asu;
 
-        final AuthorizationCodeFlow flow = new AuthorizationCodeFlow.Builder(BearerToken.queryParameterAccessMethod(),
-                transportForThisRequest, JSON_FACTORY, tokenServerURL,
-                new ClientParametersAuthentication(getDefaultedClientId(), getDefaultedClientSecret().getPlainText()),
-                getDefaultedClientId(), authorizationServerURL).setScopes(Arrays.asList(SCOPE_INFO, SCOPE_CHECK_ACCESS))
-                        .build();
-
+        String defaultedClientId = getDefaultedClientId();
+        ClientParametersAuthentication clientAuthentication = new ClientParametersAuthentication(defaultedClientId, accessToken);
+        List<String> scopes = Arrays.asList(SCOPE_INFO, SCOPE_CHECK_ACCESS);
+        AccessMethod queryParameters = BearerToken.queryParameterAccessMethod();
+        LOGGER.info(format("Performing OpenShift AuthorizationCodeFlow using: tokenServerURL=[%s]", tokenServerURL.toString()));
+        LOGGER.info(format("AuthorizationCodeFlow using : queryParameters=[%s], transport=[%s], ", queryParameters, transportForThisRequest));
+        LOGGER.info(format("AuthorizationCodeFlow using : clientAuthentication=[%s], clientId=[%s], ", clientAuthentication, defaultedClientId));
+        LOGGER.info(format("AuthorizationCodeFlow using : authorizationServerURL=[%s], ", authorizationServerURL));
+        final AuthorizationCodeFlow flow = new AuthorizationCodeFlow.Builder(queryParameters, transportForThisRequest, 
+                                                                             JSON_FACTORY, tokenServerURL, clientAuthentication, 
+                                                                             defaultedClientId, authorizationServerURL
+                                                                             ).setScopes(scopes).build();
         final OpenShiftOAuth2SecurityRealm secRealm = this;
         final String url = buildOAuthRedirectUrl(redirectOnFinish);
-
-        return new BearerTokenOAuthSession(flow, from, url, redirectOnFinish, url, flow, secRealm);
+        BearerTokenOAuthSession bearerTokenOAuthSession = new BearerTokenOAuthSession(flow, from, url, redirectOnFinish, url, flow, secRealm);
+        LOGGER.info(String.format("The created BearerTokenOAuthSession  is  [%s]", bearerTokenOAuthSession.toString()));
+        return bearerTokenOAuthSession;
     }
 
     public UsernamePasswordAuthenticationToken updateAuthorizationStrategy(Credential credential)
